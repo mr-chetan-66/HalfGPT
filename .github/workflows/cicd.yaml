@@ -5,6 +5,10 @@ on:
     branches:
       - main
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   Continuous-Integration:
     runs-on: ubuntu-latest
@@ -16,9 +20,8 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-to-assume: arn:aws:iam::032397977896:role/halfgpt-github-actions-role
+          aws-region: ap-south-1
 
       - name: Login to Amazon ECR
         id: login-ecr
@@ -39,61 +42,82 @@ jobs:
 
   Continuous-Deployment:
     needs: Continuous-Integration
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
 
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-to-assume: arn:aws:iam::032397977896:role/halfgpt-github-actions-role
+          aws-region: ap-south-1
 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Pull latest Docker image from ECR
+      - name: Deploy to EC2 through Systems Manager
         env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPO }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+          ECR_REPO: ${{ secrets.ECR_REPO }}
+          EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+          APP_SECRET_ID: ${{ secrets.APP_SECRET_ID }}
           IMAGE_TAG: latest
         run: |
-          docker pull $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          set -euo pipefail
 
-      - name: Verify persistent EBS storage
-        run: |
-          mountpoint -q /mnt/halfgpt || { echo "/mnt/halfgpt is not mounted"; exit 1; }
-          mkdir -p /mnt/halfgpt/data /mnt/halfgpt/chroma_db /mnt/halfgpt/uploads
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_REGISTRY="$ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com"
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG"
+          export ECR_REGISTRY IMAGE_URI
 
-      - name: Stop and remove old container
-        run: |
-          docker stop agentic-chatbot || true
-          docker rm agentic-chatbot || true
+          PARAMETERS=$(python3 - <<'PY'
+          import json
+          import os
+          import shlex
 
-      - name: Run new Docker container
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPO }}
-          IMAGE_TAG: latest
-        run: |
-          docker run -d \
-            --name agentic-chatbot \
-            --restart always \
-            -p 8080:8080 \
-            -v /mnt/halfgpt/data:/app/data \
-            -v /mnt/halfgpt/chroma_db:/app/chroma_db \
-            -v /mnt/halfgpt/uploads:/app/uploads \
-            -e GROQ_API_KEY="${{ secrets.GROQ_API_KEY }}" \
-            -e GROQ_MODEL="${{ secrets.GROQ_MODEL }}" \
-            -e GOOGLE_SEARCH_API_KEY="${{ secrets.GOOGLE_SEARCH_API_KEY }}" \
-            -e GOOGLE_CSE_ID="${{ secrets.GOOGLE_CSE_ID }}" \
-            -e TAVILY_API_KEY="${{ secrets.TAVILY_API_KEY }}" \
-            -e LANGSMITH_TRACING="${{ secrets.LANGSMITH_TRACING }}" \
-            -e LANGSMITH_ENDPOINT="${{ secrets.LANGSMITH_ENDPOINT }}" \
-            -e LANGSMITH_API_KEY="${{ secrets.LANGSMITH_API_KEY }}" \
-            -e LANGSMITH_PROJECT="${{ secrets.LANGSMITH_PROJECT }}" \
-            $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          region = os.environ['AWS_DEFAULT_REGION']
+          registry = os.environ['ECR_REGISTRY']
+          image = os.environ['IMAGE_URI']
+          secret_id = os.environ['APP_SECRET_ID']
+          commands = [
+              'set -euo pipefail',
+              'mountpoint -q /mnt/halfgpt || { echo "EBS volume is not mounted at /mnt/halfgpt"; exit 1; }',
+              'mkdir -p /mnt/halfgpt/data /mnt/halfgpt/chroma_db /mnt/halfgpt/uploads',
+              f'aws ecr get-login-password --region {shlex.quote(region)} | docker login --username AWS --password-stdin {shlex.quote(registry)}',
+              f'docker pull {shlex.quote(image)}',
+              f'aws secretsmanager get-secret-value --secret-id {shlex.quote(secret_id)} --query SecretString --output text > /mnt/halfgpt/app.env',
+              'chmod 600 /mnt/halfgpt/app.env',
+              'docker stop agentic-chatbot || true',
+              'docker rm agentic-chatbot || true',
+              f'docker run -d --name agentic-chatbot --restart always -p 8080:8080 -v /mnt/halfgpt/data:/app/data -v /mnt/halfgpt/chroma_db:/app/chroma_db -v /mnt/halfgpt/uploads:/app/uploads --env-file /mnt/halfgpt/app.env {shlex.quote(image)}',
+              'for attempt in $(seq 1 30); do if curl -fsS http://localhost:8080/ >/dev/null; then exit 0; fi; sleep 2; done',
+              'docker logs --tail 100 agentic-chatbot',
+              'exit 1'
+          ]
+          print(json.dumps({'commands': commands}))
+          PY
+          )
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy HalfGPT $GITHUB_SHA" \
+            --timeout-seconds 600 \
+            --parameters "$PARAMETERS" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM command: $COMMAND_ID"
+          if ! aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID"; then
+            aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query '{Status:StatusDetails,Stdout:StandardOutputContent,Stderr:StandardErrorContent}' \
+              --output json
+            exit 1
+          fi
+
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$EC2_INSTANCE_ID" \
+            --query 'StandardOutputContent' \
+            --output text
 
       - name: Clean unused Docker images
         run: |
