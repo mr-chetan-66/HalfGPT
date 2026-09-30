@@ -82,7 +82,7 @@ jobs:
           image = os.environ['IMAGE_URI']
           secret_id = os.environ['APP_SECRET_ID']
           commands = [
-              'set -euo pipefail',
+              'set -eu',
               'mountpoint -q /mnt/halfgpt || { echo "EBS volume is not mounted at /mnt/halfgpt"; exit 1; }',
               'mkdir -p /mnt/halfgpt/data /mnt/halfgpt/chroma_db /mnt/halfgpt/uploads',
               f'aws ecr get-login-password --region {shlex.quote(region)} | docker login --username AWS --password-stdin {shlex.quote(registry)}',
