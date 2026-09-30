@@ -1,0 +1,15 @@
+# Environments
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Local secrets and runtime data
+.env
+.env.*
+!.env.example
+data/
+chroma_db/
+uploads/
