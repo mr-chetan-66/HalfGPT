@@ -148,6 +148,23 @@ def sse_data(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+class ToolContextIterator:
+    def __init__(self, iterator, thread_id: str, profile_id: str | None):
+        self.iterator = iterator
+        self.thread_id = thread_id
+        self.profile_id = profile_id
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        context_tokens = set_tool_context(self.thread_id, self.profile_id)
+        try:
+            return next(self.iterator)
+        finally:
+            reset_tool_context(context_tokens)
+
+
 def should_stream_chunk(chunk, metadata) -> bool:
     """
     This prevents raw tool/search/RAG JSON from appearing in the frontend.
@@ -270,7 +287,6 @@ async def chat_stream(request: Request):
     }
 
     def event_generator():
-        context_tokens = set_tool_context(thread_id, profile_id)
         final_answer = ""
 
         try:
@@ -302,11 +318,9 @@ async def chat_stream(request: Request):
         except Exception as e:
             yield sse_data({"error": str(e)})
             yield sse_data({"done": True})
-        finally:
-            reset_tool_context(context_tokens)
 
     return StreamingResponse(
-        event_generator(),
+        ToolContextIterator(event_generator(), thread_id, profile_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
