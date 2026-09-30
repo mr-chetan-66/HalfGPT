@@ -59,10 +59,10 @@ jobs:
 
       - name: Deploy to EC2 through Systems Manager
         env:
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
-          ECR_REPO: ${{ secrets.ECR_REPO }}
-          EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
-          APP_SECRET_ID: ${{ secrets.APP_SECRET_ID }}
+          AWS_DEFAULT_REGION: ap-south-1
+          ECR_REPO: halfgpt
+          EC2_INSTANCE_ID: i-002298c0aef0e4c2b
+          APP_SECRET_ID: halfgpt/prod
           IMAGE_TAG: latest
         run: |
           set -euo pipefail
