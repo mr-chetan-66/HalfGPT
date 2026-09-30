@@ -1,6 +1,6 @@
 # HalfGPT AWS Deployment
 
-This guide deploys HalfGPT to one Ubuntu EC2 instance. GitHub Actions builds the Docker image, pushes it to ECR, and asks a self-hosted runner on EC2 to replace the running container. An attached EBS volume preserves chat data, Chroma's index, and uploaded files across deployments.
+This guide deploys HalfGPT to one Ubuntu EC2 instance. GitHub Actions builds the Docker image, pushes it to ECR, and uses AWS Systems Manager (SSM) Run Command to replace the running container. The deployment job runs on GitHub-hosted infrastructure; no SSH connection or self-hosted runner is required. An attached EBS volume preserves chat data, Chroma's index, and uploaded files across deployments.
 
 ## Architecture and prerequisites
 
@@ -10,10 +10,11 @@ This guide deploys HalfGPT to one Ubuntu EC2 instance. GitHub Actions builds the
 - One EC2 instance running Ubuntu 24.04 LTS
 - One ECR repository named `halfgpt`
 - One EBS data volume mounted at `/mnt/halfgpt`
+- One Secrets Manager secret containing the app's environment file
 
 A `t3.medium` instance and a 30 GB `gp3` data volume are reasonable starting points for a small deployment. Actual cost depends on region, uptime, storage, and network usage; check the AWS Pricing Calculator before creating resources.
 
-The workflow deploys to port `8080`. For a production domain, put Nginx or an Application Load Balancer with HTTPS in front of it. Do not leave SSH open to the entire internet.
+The workflow deploys to port `8080`. SSM Agent uses outbound HTTPS to connect to AWS, so no inbound SSH rule is needed. For a production domain, put Nginx or an Application Load Balancer with HTTPS in front of the app.
 
 ## 1. Create the ECR repository
 
@@ -29,18 +30,16 @@ Enable image scanning on push if available. Note the AWS region; `ECR_REPO` in G
 
 1. Launch Ubuntu Server 24.04 LTS, 64-bit x86.
 2. Choose an instance size such as `t3.medium` to start.
-3. Create or select an SSH key pair and download it securely.
-4. Create a security group with:
-   - SSH, TCP 22, source set to **My IP** only.
-   - TCP 8080 for initial testing. Restrict it to your IP if possible; for production, expose HTTPS through a reverse proxy or load balancer instead.
+3. No SSH key pair is required for this deployment; use Systems Manager Session Manager for administration.
+4. Create a security group with TCP 8080 from **My IP** for initial testing. For production, expose HTTPS through a reverse proxy or load balancer instead. Do not add an SSH ingress rule.
 5. Allocate and associate an Elastic IP if you need a stable public address.
 6. Create a separate EBS `gp3` volume in the same Availability Zone as the instance, then attach it to the instance.
 
-Keep the SSH private key and AWS credentials out of the repository.
+Keep AWS credentials out of the repository.
 
 ## 3. Format and mount the EBS data volume
 
-Connect to the instance and identify the newly attached volume:
+Open **Systems Manager → Session Manager**, start a session to the managed instance, and identify the newly attached volume:
 
 ```bash
 lsblk -f
@@ -80,76 +79,120 @@ sudo chown -R ubuntu:ubuntu /mnt/halfgpt
 
 The GitHub Actions workflow checks that `/mnt/halfgpt` is mounted before replacing the container. This prevents deployment from silently writing data to the instance's root disk if EBS is unavailable.
 
-## 4. Install Docker
+## 4. Install Docker and verify SSM Agent
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y docker.io git curl
+sudo apt-get install -y docker.io awscli jq curl
 sudo systemctl enable --now docker
 sudo usermod -aG docker ubuntu
 ```
 
-Log out and reconnect so the `ubuntu` user's Docker group membership takes effect, then verify:
+Ubuntu EC2 images commonly include SSM Agent. Verify that it is running:
+
+```bash
+sudo systemctl status snap.amazon-ssm-agent.amazon-ssm-agent.service
+```
+
+If that unit is not present, install and start the agent:
+
+```bash
+sudo snap install amazon-ssm-agent --classic
+sudo systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service
+```
+
+Verify Docker and the command-line tools:
 
 ```bash
 docker run --rm hello-world
+aws --version
+jq --version
 ```
 
-## 5. Give GitHub Actions access to ECR
+## 5. Attach an IAM role to EC2 for SSM, ECR, and Secrets Manager
 
-The existing workflow uses AWS access-key secrets with `aws-actions/configure-aws-credentials`. Create a dedicated IAM identity for this workflow and grant only the ECR permissions it needs. The AWS managed `AmazonEC2ContainerRegistryPowerUser` policy is a simple starting point; a repository-scoped custom policy is better for production. The workflow does not need broad EC2 administrator access because it deploys through the runner on the instance.
+Create an IAM role with **EC2** as its trusted service, then attach these permissions:
 
-Create an access key for the IAM identity and add it to GitHub Secrets in the next step. Never commit the key or put it in the Docker image. GitHub OIDC is a stronger long-term alternative to static access keys, but requires changing the workflow's AWS credential configuration.
+- `AmazonSSMManagedInstanceCore` so SSM Agent can register and receive Run Command requests.
+- `AmazonEC2ContainerRegistryReadOnly` so the instance can authenticate to ECR and pull the image.
+- A custom policy granting `secretsmanager:GetSecretValue` only on the HalfGPT app secret created in the next step. If that secret uses a customer-managed KMS key, also grant `kms:Decrypt` on that key.
 
-## 6. Install the GitHub self-hosted runner on EC2
+Attach the role to the EC2 instance using **EC2 → Instances → select instance → Actions → Security → Modify IAM role**. In Systems Manager, confirm the instance appears as an online managed node in the same Region.
 
-The deployment job in `.github/workflows/cicd.yaml` uses `runs-on: self-hosted`, so a runner must be online on the EC2 instance.
+The instance must have outbound HTTPS access to Systems Manager, ECR, Secrets Manager, and AWS service endpoints. No inbound SSH rule is needed. A public subnet with outbound internet access is sufficient for a small deployment; private subnets need the relevant VPC endpoints or NAT access.
 
-1. In GitHub, open the repository's **Settings → Actions → Runners → New self-hosted runner**.
-2. Select Linux x64 and follow GitHub's current download/configuration commands on EC2 as the `ubuntu` user. GitHub generates a temporary registration token; do not put it in the repository.
-3. Install and start the runner service using the commands shown by GitHub. Common commands from the runner directory are:
+## 6. Create the HalfGPT secret in Secrets Manager
 
-```bash
-sudo ./svc.sh install ubuntu
-sudo ./svc.sh start
-sudo ./svc.sh status
+Open **AWS Secrets Manager → Store a new secret → Other type of secret → Plaintext**. Set the secret name to `halfgpt/prod` and store the app environment file as the secret value:
+
+```env
+GROQ_API_KEY=your_groq_api_key
+GROQ_MODEL=openai/gpt-oss-20b
+TAVILY_API_KEY=your_tavily_api_key
+GOOGLE_SEARCH_API_KEY=
+GOOGLE_CSE_ID=
+LANGSMITH_TRACING=false
+LANGSMITH_ENDPOINT=https://api.smith.langchain.com
+LANGSMITH_API_KEY=
+LANGSMITH_PROJECT=halfgpt
 ```
 
-4. Confirm the runner appears **Idle** in the repository's Runners page.
+Enter your real key values directly into Secrets Manager; do not put them in the GitHub workflow or SSM command parameters. Google Search is optional and falls back to Tavily. Google has closed the Custom Search JSON API to new customers and plans to end it on January 1, 2027; see Google's [API notice](https://developers.google.com/custom-search/v1/overview).
 
-The runner account needs Docker access and permission to read/write `/mnt/halfgpt`. Restart the runner service after changing group membership. Since this is a self-hosted runner with access to production data, do not run untrusted pull-request workflows on it.
+Add the instance role permission `secretsmanager:GetSecretValue` for this secret's ARN only. The workflow will ask SSM to retrieve the secret on the instance and write it to `/mnt/halfgpt/app.env` with mode `600`; Docker reads that file when starting the container.
 
-## 7. Configure GitHub repository secrets
+## 7. Give GitHub Actions deployment permissions
+
+The workflow uses GitHub-hosted `ubuntu-latest` runners. Create a dedicated IAM identity for the workflow with:
+
+- ECR push permissions for the `halfgpt` repository. `AmazonEC2ContainerRegistryPowerUser` is a simple starting point; a repository-scoped policy is preferable for production.
+- `ssm:SendCommand` on the `AWS-RunShellScript` document and only the target EC2 instance.
+- `ssm:GetCommandInvocation` and `ssm:ListCommandInvocations` to wait for deployment and report its result.
+
+For the SSM permissions, create an inline policy like this, replacing the placeholders:
+
+```json
+{
+	"Version": "2012-10-17",
+	"Statement": [
+		{
+			"Effect": "Allow",
+			"Action": "ssm:SendCommand",
+			"Resource": [
+				"arn:aws:ssm:REGION::document/AWS-RunShellScript",
+				"arn:aws:ec2:REGION:ACCOUNT_ID:instance/INSTANCE_ID"
+			]
+		},
+		{
+			"Effect": "Allow",
+			"Action": [
+				"ssm:GetCommandInvocation",
+				"ssm:ListCommandInvocations"
+			],
+			"Resource": "*"
+		}
+	]
+}
+```
+
+The workflow currently authenticates using access-key GitHub Secrets. Create an access key for this IAM identity and add it in the next step. Do **not** grant `AmazonEC2FullAccess`; the workflow deploys through SSM and does not need direct EC2 administration. GitHub OIDC can replace static AWS access keys later.
+
+## 8. Configure GitHub repository secrets
 
 Open **Settings → Secrets and variables → Actions → New repository secret** and add:
 
 | Secret | Value |
 | --- | --- |
-| `AWS_ACCESS_KEY_ID` | Access key ID for the dedicated ECR IAM identity |
+| `AWS_ACCESS_KEY_ID` | Access key ID for the GitHub deployment IAM identity |
 | `AWS_SECRET_ACCESS_KEY` | Secret access key for that identity |
-| `AWS_DEFAULT_REGION` | Region containing the ECR repository, for example `us-east-1` |
+| `AWS_DEFAULT_REGION` | Region containing EC2 and ECR, for example `us-east-1` |
 | `ECR_REPO` | `halfgpt` |
-| `GROQ_API_KEY` | Groq API key for chat |
-| `GROQ_MODEL` | `openai/gpt-oss-20b` |
-| `TAVILY_API_KEY` | Tavily key used as web-search fallback |
+| `EC2_INSTANCE_ID` | Instance ID, for example `i-0123456789abcdef0` |
+| `APP_SECRET_ID` | `halfgpt/prod` or the secret's ARN |
 
-These are optional:
+App API keys belong only in Secrets Manager, not GitHub Secrets. Never commit `.env`; the Docker build context excludes local env files and runtime data. Revoke and rotate any API keys previously exposed in chat or terminal output before deployment.
 
-| Secret | When needed |
-| --- | --- |
-| `GOOGLE_SEARCH_API_KEY` | Only if you already have access to Google's Custom Search JSON API |
-| `GOOGLE_CSE_ID` | Search engine ID paired with the Google Search API key |
-| `LANGSMITH_TRACING` | Set to `true` only when enabling tracing; otherwise `false` |
-| `LANGSMITH_ENDPOINT` | Usually `https://api.smith.langchain.com` when tracing is enabled |
-| `LANGSMITH_API_KEY` | LangSmith key when tracing is enabled |
-| `LANGSMITH_PROJECT` | Optional LangSmith project name |
-
-Google has closed the Custom Search JSON API to new customers and plans to end it on January 1, 2027. Without existing Google API access, HalfGPT falls back to Tavily. See Google's [Custom Search JSON API notice](https://developers.google.com/custom-search/v1/overview).
-
-Do not commit `.env`. The Docker build context excludes local `.env` files and local runtime data.
-If you have not already done so, revoke and rotate API keys that were previously exposed in chat or terminal output before adding replacement keys to GitHub Secrets.
-
-## 8. Deploy
+## 9. Deploy
 
 The workflow is triggered by a push to the `main` branch. Push the deployment-ready code:
 
@@ -163,14 +206,14 @@ Then open **GitHub → Actions** and watch the workflow. It should:
 
 1. Build the Docker image on a GitHub-hosted runner.
 2. Push the image to ECR.
-3. Run the deployment job on the EC2 self-hosted runner.
-4. Verify the EBS mount, pull the image, and recreate the container with persistent mounts for `/app/data`, `/app/chroma_db`, and `/app/uploads`.
+3. Use SSM Run Command to deploy to the specified EC2 instance from the GitHub-hosted runner.
+4. Verify the EBS mount, fetch app config from Secrets Manager, pull the image, and recreate the container with persistent mounts for `/app/data`, `/app/chroma_db`, and `/app/uploads`.
 
 The first deployment fails intentionally if `/mnt/halfgpt` is not mounted. Fix the EBS mount rather than removing that guard.
 
-## 9. Verify the service
+## 10. Verify the service
 
-On EC2:
+Use **Systems Manager → Session Manager** to open a shell on EC2, then run:
 
 ```bash
 docker ps --filter name=agentic-chatbot
@@ -187,7 +230,7 @@ http://EC2_PUBLIC_IP:8080/
 
 If you associated an Elastic IP, use that address. For a public production site, configure a domain and HTTPS rather than leaving port 8080 broadly exposed.
 
-## 10. Updates, persistence, and recovery
+## 11. Updates, persistence, and recovery
 
 Push updates to `main`; GitHub Actions builds and deploys them. The container can be deleted and recreated without losing the three mounted data directories, as long as the EBS volume remains attached and mounted at `/mnt/halfgpt`.
 
@@ -196,7 +239,6 @@ Create regular EBS snapshots. Also back up the SQLite databases and the Chroma/u
 Useful checks:
 
 ```bash
-# Runner/service logs are available from the runner's service setup.
 sudo docker logs --tail 200 agentic-chatbot
 sudo docker inspect agentic-chatbot --format '{{json .Mounts}}'
 mountpoint /mnt/halfgpt
@@ -204,10 +246,12 @@ mountpoint /mnt/halfgpt
 
 ## Troubleshooting
 
-- **Workflow waits for a runner:** make sure the EC2 runner service is online and shows **Idle** in GitHub.
+- **SSM reports the instance is offline:** verify SSM Agent is running, the EC2 IAM role is attached, and outbound HTTPS access to SSM endpoints is allowed.
+- **SSM command is denied:** check that the GitHub deployment identity can send `AWS-RunShellScript` to this instance and read command invocation results.
+- **Secrets Manager access is denied:** check the EC2 role's scoped `secretsmanager:GetSecretValue` permission and the `APP_SECRET_ID` GitHub secret.
 - **EBS guard fails:** run `lsblk -f`, inspect `/etc/fstab`, then `sudo mount -a`; do not format the volume again if it already has data.
 - **ECR authentication/pull fails:** confirm `AWS_DEFAULT_REGION`, `ECR_REPO`, IAM ECR permissions, and that the repository is in that region.
 - **Container exits:** inspect `docker logs --tail 200 agentic-chatbot` on EC2.
-- **Chat reports missing Groq key:** verify `GROQ_API_KEY` and `GROQ_MODEL` are configured as GitHub Actions secrets.
+- **Chat reports missing Groq key:** verify `GROQ_API_KEY` and `GROQ_MODEL` are present in the Secrets Manager environment-file value and that the EC2 role can read the secret.
 - **Web search fails:** verify `TAVILY_API_KEY`; Google Search settings only work for existing Custom Search API customers.
 - **Site does not load:** confirm the container is running, port 8080 is published, and the security group permits inbound traffic from your client. Restrict the rule to your IP for testing.

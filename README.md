@@ -12,11 +12,11 @@ It supports real-time streaming chat, document uploads, retrieval-augmented gene
 * Stream responses in real time
 * Upload documents such as PDF, DOCX, TXT, MD, PY, and CSV
 * Use uploaded files as context through RAG
-* Search the web with Tavily for current information
+* Search the web with Google when configured, with Tavily fallback
 * Store and recall conversation history
 * Simple FastAPI-based web interface
 * Docker-ready deployment
-* AWS CI/CD support using GitHub Actions, ECR, and EC2
+* AWS CI/CD deployment through GitHub Actions, ECR, EC2, and Systems Manager
 
 ---
 
@@ -30,7 +30,7 @@ This project combines:
 * **LangChain** for tools, messages, and RAG workflow
 * **Groq** for chat completions
 * **ChromaDB's local embedding model** for document search
-* **Tavily** for web search
+* **Google Search**, with **Tavily** fallback
 * **ChromaDB** for vector search over uploaded documents
 * **SQLite** for conversation and persistence
 * **Docker** for containerized deployment
@@ -53,7 +53,7 @@ Optional for deployment:
 * AWS account
 * Amazon ECR repository
 * EC2 instance
-* GitHub Actions self-hosted runner
+* AWS Systems Manager (SSM) Run Command
 
 ---
 
@@ -192,176 +192,11 @@ http://localhost:8080
 
 ---
 
-## AWS CI/CD Deployment with GitHub Actions
+## AWS Deployment
 
-This project can be deployed to AWS using:
+The GitHub Actions workflow builds and pushes the Docker image to ECR, then deploys to EC2 through AWS Systems Manager Run Command. It uses a GitHub-hosted runner, so no SSH access or GitHub self-hosted runner is required. Chat, Chroma, and uploads persist on an attached EBS volume.
 
-* GitHub Actions
-* Amazon ECR
-* Amazon EC2
-* Docker
-* GitHub self-hosted runner
-
----
-
-### 1. Create an IAM User
-
-Create an IAM user for deployment and attach the following policies:
-
-```text
-AmazonEC2ContainerRegistryFullAccess
-AmazonEC2FullAccess
-```
-
-You can also use a more restricted custom IAM policy for production.
-
----
-
-### 2. Create an ECR Repository
-
-Create an Amazon ECR repository.
-
-Example full ECR image URI:
-
-```text
-<aws-account-id>.dkr.ecr.<aws-region>.amazonaws.com/halfgpt
-```
-
-For GitHub Secrets, only save the repository name:
-
-```text
-ECR_REPO=halfgpt
-```
-
-Do not save the full ECR URI as `ECR_REPO`.
-
----
-
-### 3. Create an EC2 Instance
-
-Create an Ubuntu EC2 instance.
-
-Recommended inbound security group rule:
-
-```text
-Type: Custom TCP
-Port: 8080
-Source: 0.0.0.0/0
-```
-
----
-
-### 4. Install Docker on EC2
-
-Connect to your EC2 instance and run:
-
-```bash
-sudo apt-get update -y
-sudo apt-get upgrade -y
-```
-
-Install Docker:
-
-```bash
-curl -fsSL https://get.docker.com -o get-docker.sh
-sudo sh get-docker.sh
-```
-
-Add the Ubuntu user to the Docker group:
-
-```bash
-sudo usermod -aG docker ubuntu
-newgrp docker
-```
-
-Check Docker:
-
-```bash
-docker --version
-```
-
----
-
-### 5. Configure EC2 as a GitHub Self-Hosted Runner
-
-Go to your GitHub repository:
-
-```text
-Settings → Actions → Runners → New self-hosted runner
-```
-
-Select Linux and follow the commands shown by GitHub.
-
-After setup, start the runner:
-
-```bash
-./run.sh
-```
-
-For production, you can configure the runner as a service:
-
-```bash
-sudo ./svc.sh install
-sudo ./svc.sh start
-```
-
----
-
-## GitHub Secrets
-
-Add the following secrets in your GitHub repository:
-
-```text
-AWS_ACCESS_KEY_ID
-AWS_SECRET_ACCESS_KEY
-AWS_DEFAULT_REGION
-ECR_REPO
-
-GROQ_API_KEY
-GROQ_MODEL
-GOOGLE_SEARCH_API_KEY
-GOOGLE_CSE_ID
-TAVILY_API_KEY
-LANGSMITH_TRACING
-LANGSMITH_ENDPOINT
-LANGSMITH_API_KEY
-LANGSMITH_PROJECT
-```
-
-Path:
-
-```text
-GitHub Repository → Settings → Secrets and variables → Actions → New repository secret
-```
-
-Example:
-
-```text
-AWS_DEFAULT_REGION=us-east-1
-ECR_REPO=halfgpt
-GROQ_MODEL=openai/gpt-oss-20b
-LANGSMITH_TRACING=true
-LANGSMITH_ENDPOINT=https://api.smith.langchain.com
-LANGSMITH_PROJECT=halfgpt
-```
-
----
-
-## GitHub Actions Workflow
-
-Create this file:
-
-```text
-.github/workflows/cicd.yaml
-```
-
-This workflow will:
-
-1. Build your Docker image
-2. Push the image to Amazon ECR
-3. Pull the latest image on EC2
-4. Stop the old container
-5. Run the new container
+Follow [DEPLOY.md](DEPLOY.md) for the complete setup, including the EC2 instance role, SSM, EBS mount, Secrets Manager, GitHub permissions, and verification steps.
 
 ---
 
