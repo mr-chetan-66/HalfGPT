@@ -34,7 +34,7 @@ from database import (
     delete_conversation_records)
 
 from rag import add_document_to_rag, delete_thread_documents
-from tools import set_current_thread_id
+from tools import reset_tool_context, set_tool_context
 
 
 app = FastAPI()
@@ -228,6 +228,11 @@ async def chat_stream(request: Request):
 
     user_message = data.get("message", "")
     thread_id = data.get("thread_id", "default")
+    profile_id = data.get("profile_id")
+    try:
+        profile_id = str(uuid.UUID(profile_id)) if profile_id else None
+    except (AttributeError, TypeError, ValueError):
+        profile_id = None
     selected_model = data.get("model", os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"))
 
     if not user_message.strip():
@@ -258,8 +263,6 @@ async def chat_stream(request: Request):
     create_or_update_conversation(thread_id, user_message)
     save_chat_message(thread_id, "user", user_message)
 
-    set_current_thread_id(thread_id)
-
     config = {
         "configurable": {
             "thread_id": thread_id
@@ -267,6 +270,7 @@ async def chat_stream(request: Request):
     }
 
     def event_generator():
+        context_tokens = set_tool_context(thread_id, profile_id)
         final_answer = ""
 
         try:
@@ -298,6 +302,8 @@ async def chat_stream(request: Request):
         except Exception as e:
             yield sse_data({"error": str(e)})
             yield sse_data({"done": True})
+        finally:
+            reset_tool_context(context_tokens)
 
     return StreamingResponse(
         event_generator(),

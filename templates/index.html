@@ -691,6 +691,13 @@
         localStorage.setItem("thread_id", threadId);
     }
 
+    let profileId = localStorage.getItem("profile_id");
+
+    if (!profileId || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(profileId)) {
+        profileId = createThreadId();
+        localStorage.setItem("profile_id", profileId);
+    }
+
     const savedModel = localStorage.getItem("selected_model");
 
     if (savedModel && modelSelect) {
@@ -1221,6 +1228,7 @@
                 body: JSON.stringify({
                     message: message,
                     thread_id: threadId,
+                    profile_id: profileId,
                     model: selectedModel
                 })
             });

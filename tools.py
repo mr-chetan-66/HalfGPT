@@ -1,6 +1,7 @@
 import math
 import json
 import os
+from contextvars import ContextVar
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -15,12 +16,31 @@ from rag import retrieve_from_rag
 load_dotenv()
 
 
-CURRENT_THREAD_ID = "default"
+CURRENT_THREAD_ID = ContextVar("current_thread_id", default="default")
+CURRENT_PROFILE_ID = ContextVar("current_profile_id", default=None)
 
 
-def set_current_thread_id(thread_id: str):
-    global CURRENT_THREAD_ID
-    CURRENT_THREAD_ID = thread_id
+def set_tool_context(thread_id: str, profile_id: str | None = None):
+    return (
+        CURRENT_THREAD_ID.set(thread_id),
+        CURRENT_PROFILE_ID.set(profile_id)
+    )
+
+
+def reset_tool_context(tokens):
+    thread_token, profile_token = tokens
+    CURRENT_PROFILE_ID.reset(profile_token)
+    CURRENT_THREAD_ID.reset(thread_token)
+
+
+def memory_scopes():
+    scopes = [CURRENT_THREAD_ID.get()]
+    profile_id = CURRENT_PROFILE_ID.get()
+
+    if profile_id:
+        scopes.insert(0, f"profile:{profile_id}")
+
+    return list(dict.fromkeys(scopes))
 
 
 @tool
@@ -135,7 +155,7 @@ def search_uploaded_documents(query: str) -> str:
 
     return retrieve_from_rag(
         query=query,
-        thread_id=CURRENT_THREAD_ID
+        thread_id=CURRENT_THREAD_ID.get()
     )
 
 
@@ -148,10 +168,15 @@ def remember_this(memory: str) -> str:
     Use this when the user asks you to remember something.
     """
 
-    return save_memory(
-        thread_id=CURRENT_THREAD_ID,
-        memory=memory
-    )
+    scopes = memory_scopes()
+
+    for scope in scopes:
+        save_memory(thread_id=scope, memory=memory)
+
+    if CURRENT_PROFILE_ID.get():
+        return "Memory saved for this chat and future chats in this browser."
+
+    return "Memory saved successfully."
 
 
 
@@ -161,10 +186,27 @@ def recall_memory(query: str) -> str:
     Recall saved long-term memories about the user or this conversation.
     """
 
-    return search_memory(
-        thread_id=CURRENT_THREAD_ID,
-        query=query
-    )
+    memories = []
+    seen = set()
+
+    for scope in memory_scopes():
+        result = search_memory(thread_id=scope, query=query)
+
+        for line in result.splitlines():
+            if not line.startswith("- "):
+                continue
+
+            memory = line[2:].strip()
+            key = memory.casefold()
+
+            if memory and key not in seen:
+                memories.append(memory)
+                seen.add(key)
+
+    if not memories:
+        return "No saved memory found."
+
+    return "\n".join(f"- {memory}" for memory in memories[:10])
 
 
 
